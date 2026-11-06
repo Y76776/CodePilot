@@ -9,6 +9,7 @@ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage, messa
 from langchain_core.prompts import ChatPromptTemplate
 
 from codepilot.session.context import estimate_tokens
+from codepilot.session.memory import MemoryEntry
 
 CATEGORIES = ("goals", "findings", "failed_attempts", "validation", "todos")
 
@@ -123,7 +124,7 @@ class LangMemCompactor:
 def validate_memory(raw, allowed_sources, store):
     if not isinstance(raw, dict) or set(raw) != set(CATEGORIES):
         raise ValueError("Summary must contain exactly the five working memory fields")
-    entries = []
+    entries: list[MemoryEntry] = []
     for category in CATEGORIES:
         if not isinstance(raw[category], list):
             raise TypeError("Memory category must be a list")

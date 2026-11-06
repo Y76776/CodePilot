@@ -168,3 +168,77 @@ def test_cli_child_enforces_scope_and_is_removed_after_returning_report(tmp_path
     finally:
         if sandbox.container is not None:
             sandbox.container.remove(force=True)
+
+
+@pytest.mark.docker
+def test_ctrl_c_terminates_delegated_command_without_waiting_for_its_timeout(tmp_path):
+    import signal
+    from time import monotonic
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    sandbox = LocalDockerSandbox(repo, image())
+    timer = None
+
+    class Model:
+        requested = False
+
+        def bind_tools(self, tools, **kwargs):
+            parent = any(tool.name == "delegate" for tool in tools)
+            owner = self
+
+            class Bound:
+                def invoke(self, messages):
+                    if parent:
+                        if not owner.requested:
+                            owner.requested = True
+                            return AIMessage(
+                                content="",
+                                tool_calls=[
+                                    {
+                                        "name": "delegate",
+                                        "id": "batch",
+                                        "args": {
+                                            "tasks": [
+                                                {
+                                                    "goal": "long operation",
+                                                    "context": "explicit",
+                                                    "allowed_files": [],
+                                                    "acceptance_criteria": "read only",
+                                                }
+                                            ]
+                                        },
+                                    }
+                                ],
+                            )
+                        return finish()
+                    return AIMessage(
+                        content="",
+                        tool_calls=[
+                            {"name": "shell", "id": "sleep", "args": {"command": "sleep 60"}}
+                        ],
+                    )
+
+            return Bound()
+
+    def observer(event):
+        nonlocal timer
+        if event["event_type"] == "tool_call" and event["name"] == "shell":
+            timer = Timer(1.0, lambda: os.kill(os.getpid(), signal.SIGINT))
+            timer.start()
+
+    try:
+        with Session.create(
+            repo, Model(), sandbox, directory=tmp_path / "state", observer=observer
+        ) as session:
+            started = monotonic()
+            result = session.request("delegate long operation")
+            assert result["termination_reason"] == "interrupted"
+            assert monotonic() - started < 30
+            assert session.request("continue")["termination_reason"] == "voluntary_completion"
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if sandbox.container is not None:
+            sandbox.container.remove(force=True)

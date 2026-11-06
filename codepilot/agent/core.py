@@ -54,6 +54,7 @@ class AgentCore:
         if max_parallel_subagents < 1:
             raise ValueError("max_parallel_subagents must be positive")
         self.model = model
+        self.provider_model = model
         self.runtime = runtime
         self.sandbox = sandbox
         self.budget = budget or DecisionBudget(max_model_calls)
@@ -99,17 +100,19 @@ class AgentCore:
         self.system_prompt = build_system_prompt(
             self.tools, is_subagent=is_subagent, interactive=max_model_calls is None
         )
-        if self.runtime is not None and hasattr(model, "bind"):
-            self.model = model.bind(max_tokens=self.runtime.config.max_output_tokens)
-        tool_options = (
+        self.bind_model()
+        self.graph = self.build_graph()
+
+    def bind_model(self):
+        options = (
             {"max_tokens": self.runtime.config.max_output_tokens}
-            if self.runtime is not None and hasattr(model, "bind")
+            if self.runtime is not None and hasattr(self.provider_model, "bind")
             else {}
         )
-        self.model_with_tools = model.bind_tools(
-            self.tools, parallel_tool_calls=True, **tool_options
+        self.model = self.provider_model.bind(**options) if options else self.provider_model
+        self.model_with_tools = self.provider_model.bind_tools(
+            self.tools, parallel_tool_calls=True, **options
         )
-        self.graph = self.build_graph()
 
     def log(self, event_type, **payload):
         if self.logger is not None:
@@ -155,9 +158,16 @@ class AgentCore:
                 error=str(exc),
             )
             raise
+        total = self.budget.record(role)
+        self.normal_responses += 1
         if self.runtime is not None:
+            if self.runtime.cancelled.is_set():
+                self.log(
+                    "model_response_cancelled",
+                    message=message_to_dict(response),
+                    total_model_calls=total,
+                )
             self.runtime.check_cancelled()
-        if self.runtime is not None:
             try:
                 self.runtime.validate_response(response)
             except ValueError as exc:
@@ -166,8 +176,6 @@ class AgentCore:
                 )
                 raise
         response.id = response.id or uuid4().hex
-        total = self.budget.record(role)
-        self.normal_responses += 1
         self.log(
             "model_response",
             role=role,

@@ -1,6 +1,24 @@
 """Conflict policy is programmatic; conflict recognition is injected and fallible."""
 
 from copy import deepcopy
+from typing import Literal
+
+from typing_extensions import NotRequired, TypedDict
+
+
+class MemoryConflict(ValueError):
+    """A saved instruction is durable but needs user correction before execution."""
+
+
+class MemoryEntry(TypedDict):
+    id: str
+    kind: Literal["pinned", "working"]
+    text: str
+    active: bool
+    timestamp: str
+    sources: list[int]
+    request_id: NotRequired[str | None]
+    category: NotRequired[str]
 
 
 def no_conflicts(entries):
@@ -8,7 +26,7 @@ def no_conflicts(entries):
     return []
 
 
-def resolve_conflicts(entries, detector, policy):
+def resolve_conflicts(entries: list[MemoryEntry], detector, policy):
     candidates = deepcopy(entries)
     by_id = {m["id"]: m for m in candidates}
     conflicts = []

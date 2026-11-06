@@ -31,7 +31,7 @@ from codepilot.session.compaction import (
 )
 from codepilot.session.context import ContextConfig, estimate_tokens, input_tokens
 from codepilot.session.delivery import describe_changes
-from codepilot.session.memory import no_conflicts, resolve_conflicts
+from codepilot.session.memory import MemoryConflict, MemoryEntry, no_conflicts, resolve_conflicts
 from codepilot.session.store import SessionStore
 
 
@@ -318,14 +318,15 @@ class Session:
             )
         return deepcopy(entries)
 
-    def save_instruction(self, text):
-        entry = {
+    def save_instruction(self, text, *, request_id=None):
+        entry: MemoryEntry = {
             "id": uuid4().hex,
             "kind": "pinned",
             "text": text,
             "active": True,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "sources": [],
+            "request_id": request_id,
         }
         self.state["memories"].append(entry)
         self.log("memory_saved", entry=dict(entry))
@@ -385,7 +386,9 @@ class Session:
         self.state["conflicts"].extend(conflicts)
         self.log("memory_conflicts", conflicts=conflicts)
         if any(c["pending"] for c in conflicts):
-            raise ValueError("Memory conflict: inspect /conflicts, edit or delete involved memory")
+            raise MemoryConflict(
+                "Memory conflict: inspect /conflicts, edit or delete involved memory"
+            )
 
     def assemble(self, system, history, memories=None, cutoff=None):
         active = self.memories() if memories is None else [m for m in memories if m["active"]]
@@ -406,6 +409,24 @@ class Session:
 
     def prepare_messages(self, agent, messages):
         system, history = messages[0], messages[1:]
+        by_request = {
+            m.get("request_id"): m
+            for m in self.state["memories"]
+            if m["kind"] == "pinned" and m.get("request_id")
+        }
+        effective = []
+        for message in history:
+            entry = by_request.get(message.id)
+            if entry and (not entry["active"] or entry["text"] != message.content):
+                message = message.model_copy(
+                    update={
+                        "content": "[Earlier saved request was superseded or edited. Original is archived as event "
+                        + str(self.state["message_sources"].get(message.id))
+                        + "; follow active instructions.]"
+                    }
+                )
+            effective.append(message)
+        history = effective
         assembled = self.assemble(system, history)
         estimated = input_tokens(assembled, agent.tools)
         self.log(
@@ -639,15 +660,24 @@ class Session:
     def request(self, text):
         if any(c["pending"] for c in self.state["conflicts"]):
             raise ValueError("Memory conflict requires editing before continuing")
+        request_id = uuid4().hex
+        conflict = None
         if text.startswith("/save") and (len(text) == 5 or text[5].isspace()):
             text = text[5:]
-            self.save_instruction(text)
+            try:
+                self.save_instruction(text, request_id=request_id)
+            except MemoryConflict as exc:
+                conflict = str(exc)
         previous = list(self.messages)
-        request_id = uuid4().hex
         self.messages.append(HumanMessage(content=text, id=request_id))
         self.state["inflight"] = True
         self.save()
         self.log("user_request", text=text, message_id=request_id)
+        if conflict is not None:
+            self.state["paused"] = True
+            self.state["inflight"] = False
+            self.log("request_paused", reason=conflict)
+            return {"termination_reason": "memory_conflict", "summary": conflict}
         return self.execute(text, previous, request_id)
 
     def retry(self):
@@ -660,11 +690,7 @@ class Session:
     def configure_context(self, **settings):
         self.config = replace(self.config, **settings)
         self.state["context_config"] = asdict(self.config)
-        if hasattr(self.model, "bind"):
-            self.agent.model = self.model.bind(max_tokens=self.config.max_output_tokens)
-            self.agent.model_with_tools = self.model.bind_tools(
-                self.agent.tools, parallel_tool_calls=True, max_tokens=self.config.max_output_tokens
-            )
+        self.agent.bind_model()
         self.log("context_configuration", settings=asdict(self.config))
 
     def check_cancelled(self):

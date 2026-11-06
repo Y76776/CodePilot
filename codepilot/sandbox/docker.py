@@ -345,6 +345,12 @@ class DockerSandbox(RepositorySandbox):
         baseline.validate_scope(list(allowed_files))
         return DockerChildSandbox(self, baseline, allowed_files)
 
+    def interrupt(self) -> None:
+        """Terminate active processes while keeping the same repository filesystem."""
+        if self.container is not None:
+            self.container.stop(timeout=3)
+            self.container.start()
+
     def stop(self) -> None:
         if self.container is None:
             return

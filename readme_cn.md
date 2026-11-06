@@ -152,7 +152,7 @@ codepilot --repo /absolute/path/to/repository --request '单次请求后退出'
 /archive {"event_id":12,"content_offset":0}
 ```
 
-`/memory` 列出有效和已失效条目及其来源，编辑与删除均留档；新轨迹不继承旧记忆。有效固定原文在每次主、子 agent 决策中提供，自动摘要不能将工作记忆升级为固定指令。默认同优先级冲突采用来源时间较新的条目，固定指令优先于工作记忆；摘要重写时间不改变事实时间。`prompt` 策略暂停并展示涉及条目与理由，编辑或删除后继续。压缩冲突的候选条目标记为 `proposed`，编辑候选后 `/retry`，旧的有效记忆在新状态通过检查前保持原状。
+`/memory` 列出有效和已失效条目及其来源，编辑与删除均留档；新轨迹不继承旧记忆。有效固定原文在每次主、子 agent 决策中提供，自动摘要不能将工作记忆升级为固定指令。默认同优先级冲突采用来源时间较新的条目，固定指令优先于工作记忆；摘要重写时间不改变事实时间。`prompt` 策略暂停并展示涉及条目与理由，编辑或删除后可 `/retry` 执行保存时的请求。被取代或编辑的固定指令在历史消息输入中替换为归档引用，原文仍保留在归档。压缩冲突的候选条目标记为 `proposed`，编辑候选后 `/retry`，旧的有效记忆在新状态通过检查前保持原状。
 
 语义冲突检测可注入；离线默认替身不做语义判断。可通过 `--stub-conflicts /tmp/conflicts.json` 演示指定原文对的冲突：
 
@@ -186,7 +186,11 @@ codepilot --repo /absolute/path/to/repository --request '单次请求后退出'
 python -m mypy codepilot scripts
 python -m pytest tests/test_cli_session.py -q
 CODEPILOT_DOCKER_TEST_IMAGE=<已有的Python和Git镜像> python -m pytest tests/test_cli_docker.py -q
+# 完整回归还需旧实验入口的 evaluation 依赖；安装依赖不会启动效果评测。
+python -m pip install -e '.[cli,dev,evaluation]'
 python -m pytest tests -q
 ```
 
 会话测试验证功能契约；Docker 集成测试验证真实副本、恢复、应用冲突、缺失副本和真实命令中断。它们都不验证模型解题效果。用完后可手工删除自己的 `codepilot.cli.*` 容器与相应会话目录；删除容器后该轨迹不能完整恢复。
+
+本轮验证：Python 3.12 下完整回归 **110 项通过**，包含以本机已有 `ice-verl:base` 镜像运行的真实 Docker/FUSE 检查；类型检查与新增代码 lint 通过。默认 Dockerfile 的构建尝试因 Docker Hub 拉取 `python:3.12-slim` 网络超时而未完成，可按 `--image` 使用满足工具前提的已有本地镜像。LangMem 依赖有一条上游弃用警告。以上均为功能验证，不是记忆或编码效果评测。

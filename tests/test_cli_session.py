@@ -769,3 +769,60 @@ def test_active_session_cannot_be_opened_twice_but_can_be_listed(tmp_path):
                 directory=tmp_path / "state",
                 sandbox_factory=lambda descriptor: FakeSandbox(),
             )
+
+
+def test_superseded_saved_request_is_archived_but_removed_from_actual_model_context(tmp_path):
+    from codepilot.session.memory import StubConflictDetector
+
+    detector = StubConflictDetector(
+        [{"first": " use tabs", "second": " use spaces", "reason": "fixture"}]
+    )
+    model = ScriptModel([finish(), finish(), finish()])
+    with Session.create(
+        tmp_path, model, FakeSandbox(), directory=tmp_path / "state", conflict_detector=detector
+    ) as session:
+        session.request("/save use tabs")
+        session.request("/save use spaces")
+        assert " use tabs" not in [m.content for m in model.inputs[-1]]
+        assert session.archive(keyword="use tabs")["events"]
+        latest = session.memories()[0]
+        session.edit_memory(latest["id"], "new explicit text")
+        session.request("continue")
+        assert " use spaces" not in [m.content for m in model.inputs[-1]]
+        assert "new explicit text" in [m.content for m in model.inputs[-1]]
+
+
+def test_returned_response_counts_as_decision_even_if_output_is_rejected(tmp_path):
+    from codepilot.session.context import ContextConfig
+
+    with Session.create(
+        tmp_path,
+        ScriptModel([AIMessage(content="x" * 10000)]),
+        FakeSandbox(),
+        directory=tmp_path / "state",
+        context_config=ContextConfig(max_output_tokens=1000),
+    ) as session:
+        with pytest.raises(ValueError, match="output budget"):
+            session.request("go")
+        assert session.agent.budget.snapshot()["total"] == 1
+
+
+def test_saved_request_paused_by_prompt_conflict_can_be_retried_after_edit(tmp_path):
+    from codepilot.session.memory import StubConflictDetector
+
+    model = ScriptModel([finish(), finish()])
+    detector = StubConflictDetector(
+        [{"first": " use tabs", "second": " use spaces", "reason": "fixture"}]
+    )
+    with Session.create(
+        tmp_path, model, FakeSandbox(), directory=tmp_path / "state", conflict_detector=detector
+    ) as session:
+        session.request("/save use tabs")
+        session.set_conflict_policy("prompt")
+        result = session.request("/save use spaces")
+        assert result["termination_reason"] == "memory_conflict"
+        assert len(model.inputs) == 1
+        older = next(m for m in session.memories() if m["text"] == " use tabs")
+        session.delete_memory(older["id"])
+        assert session.retry()["termination_reason"] == "voluntary_completion"
+        assert " use spaces" in [m.content for m in model.inputs[-1]]
