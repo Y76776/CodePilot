@@ -4,8 +4,8 @@ from threading import Lock
 class DecisionBudget:
     """Shared accounting; only the main agent uses the threshold to stop work."""
 
-    def __init__(self, threshold: int):
-        if threshold < 1:
+    def __init__(self, threshold: int | None):
+        if threshold is not None and threshold < 1:
             raise ValueError("max_model_calls must be positive")
         self.threshold = threshold
         self.lock = Lock()
@@ -22,4 +22,4 @@ class DecisionBudget:
 
     @property
     def exhausted(self) -> bool:
-        return self.snapshot()["total"] >= self.threshold
+        return self.threshold is not None and self.snapshot()["total"] >= self.threshold

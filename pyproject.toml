@@ -1,6 +1,7 @@
 [project]
 name = "codepilot"
 version = "0.1.0"
+readme = "readme.md"
 requires-python = ">=3.10"
 dependencies = [
   "langgraph>=1.0,<2",
@@ -10,7 +11,11 @@ dependencies = [
   "mfusepy>=3.1,<4",
 ]
 
+[project.scripts]
+codepilot = "codepilot.cli:main"
+
 [project.optional-dependencies]
+cli = ["langmem>=0.0.30,<0.1; python_version >= '3.11'"]
 dev = ["pytest>=8", "mypy>=1.10", "ruff>=0.9"]
 evaluation = ["swebench>=4,<6"]
 

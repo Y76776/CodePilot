@@ -11,6 +11,7 @@ from langchain_core.messages import (
     ToolMessage,
     message_to_dict,
 )
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 from pydantic import ValidationError
@@ -19,7 +20,6 @@ from codepilot.agent.budget import DecisionBudget
 from codepilot.agent.prompts import build_system_prompt
 from codepilot.agent.state import AgentState
 from codepilot.sandbox.base import BaseSandbox
-from codepilot.trajectory import TrajectoryLogger
 from codepilot.tools.delegate import create_delegate_tool
 from codepilot.tools.edit import create_edit_tool
 from codepilot.tools.finish import finish
@@ -27,6 +27,7 @@ from codepilot.tools.read import create_read_tool
 from codepilot.tools.shell import create_shell_tool
 from codepilot.tools.think import create_think_tool
 from codepilot.tools.write import create_write_tool
+from codepilot.trajectory import TrajectoryLogger
 
 
 class AgentCore:
@@ -36,7 +37,7 @@ class AgentCore:
         self,
         model,
         sandbox: BaseSandbox,
-        max_model_calls: int = 500,
+        max_model_calls: int | None = 500,
         *,
         logger=None,
         trajectory_dir=None,
@@ -46,12 +47,14 @@ class AgentCore:
         agent_id: str = "main",
         run_id=None,
         parent_tool_call_id=None,
+        runtime=None,
     ):
-        if max_model_calls < 1:
+        if max_model_calls is not None and max_model_calls < 1:
             raise ValueError("max_model_calls must be positive")
         if max_parallel_subagents < 1:
             raise ValueError("max_parallel_subagents must be positive")
         self.model = model
+        self.runtime = runtime
         self.sandbox = sandbox
         self.budget = budget or DecisionBudget(max_model_calls)
         self.is_subagent = is_subagent
@@ -89,10 +92,23 @@ class AgentCore:
         ]
         if not is_subagent:
             self.tools.append(create_delegate_tool(self.delegate_batch))
+        if self.runtime is not None:
+            self.tools.extend(self.runtime.extra_tools())
         self.tools_by_name = {tool.name: tool for tool in self.tools}
         self.max_model_calls = max_model_calls
-        self.system_prompt = build_system_prompt(self.tools, is_subagent=is_subagent)
-        self.model_with_tools = model.bind_tools(self.tools, parallel_tool_calls=True)
+        self.system_prompt = build_system_prompt(
+            self.tools, is_subagent=is_subagent, interactive=max_model_calls is None
+        )
+        if self.runtime is not None and hasattr(model, "bind"):
+            self.model = model.bind(max_tokens=self.runtime.config.max_output_tokens)
+        tool_options = (
+            {"max_tokens": self.runtime.config.max_output_tokens}
+            if self.runtime is not None and hasattr(model, "bind")
+            else {}
+        )
+        self.model_with_tools = model.bind_tools(
+            self.tools, parallel_tool_calls=True, **tool_options
+        )
         self.graph = self.build_graph()
 
     def log(self, event_type, **payload):
@@ -106,6 +122,8 @@ class AgentCore:
             )
 
     def invoke_model(self, messages, *, final=False):
+        if self.runtime is not None:
+            self.runtime.check_cancelled()
         self.model_step += 1
         role = "final_analysis" if final else ("subagent" if self.is_subagent else "main")
         self.log(
@@ -113,9 +131,21 @@ class AgentCore:
             role=role,
             step=self.model_step,
             messages=[message_to_dict(message) for message in messages],
+            **(
+                {
+                    "tools": [convert_to_openai_tool(tool) for tool in self.tools],
+                    "max_output_tokens": self.runtime.config.max_output_tokens,
+                }
+                if self.runtime is not None
+                else {}
+            ),
         )
         try:
             response = (self.model if final else self.model_with_tools).invoke(messages)
+        except KeyboardInterrupt:
+            if self.runtime is not None:
+                self.runtime.interrupt()
+            raise
         except Exception as exc:
             self.log(
                 "model_error",
@@ -125,6 +155,17 @@ class AgentCore:
                 error=str(exc),
             )
             raise
+        if self.runtime is not None:
+            self.runtime.check_cancelled()
+        if self.runtime is not None:
+            try:
+                self.runtime.validate_response(response)
+            except ValueError as exc:
+                self.log(
+                    "model_response_rejected", message=message_to_dict(response), reason=str(exc)
+                )
+                raise
+        response.id = response.id or uuid4().hex
         total = self.budget.record(role)
         self.normal_responses += 1
         self.log(
@@ -143,9 +184,10 @@ class AgentCore:
             return Command(goto="final_analysis")
 
         try:
-            response = self.invoke_model(
-                [SystemMessage(content=self.system_prompt), *state["messages"]]
-            )
+            messages = [SystemMessage(content=self.system_prompt), *state["messages"]]
+            if self.runtime is not None:
+                messages = self.runtime.prepare_messages(self, messages)
+            response = self.invoke_model(messages)
         except Exception as exc:  # Classify context limits; propagate service errors.
             if getattr(exc, "code", None) == "context_length_exceeded":
                 return Command(
@@ -214,20 +256,31 @@ class AgentCore:
 
         message_status = "error" if (failed or skipped) else "success"
 
+        full_content = content
+        if self.runtime is not None:
+            content = self.runtime.bound_output(content, name=name)
         tool_result = ToolMessage(
-            tool_call_id=tool_call_id, name=name, content=content, status=message_status
+            id=uuid4().hex,
+            tool_call_id=tool_call_id,
+            name=name,
+            content=content,
+            status=message_status,
         )
 
         self.log(
             "tool_result",
+            message_id=tool_result.id,
             tool_call_id=tool_call_id,
             name=name,
             content=content,
+            **({"full_content": full_content} if self.runtime is not None else {}),
             status=log_status,
         )
         return tool_result
 
     def invoke_tool(self, call):
+        if self.runtime is not None:
+            self.runtime.check_cancelled()
         # Convert tool failures into observations so the model can recover.
         # A nonzero shell exit code remains a completed command result;
         # the shell tool raises when it cannot execute or times out.
@@ -240,6 +293,10 @@ class AgentCore:
             result = tool.invoke({**call, "type": "tool_call"})
             if isinstance(result, ToolMessage):
                 result = result.content
+        except KeyboardInterrupt:
+            if self.runtime is not None:
+                self.runtime.interrupt()
+            raise
         except (TypeError, ValueError, KeyError, ValidationError) as e:
             return self.observation(
                 call, f"Error: invalid arguments for '{name}': {e}", failed=True
@@ -249,6 +306,8 @@ class AgentCore:
         except Exception as e:  # noqa: BLE001 - Report tool execution failures to the model.
             return self.observation(call, f"Error: tool '{name}' failed: {e}", failed=True)
 
+        if self.runtime is not None:
+            self.runtime.check_cancelled()
         if name == "shell":
             self.verification.append({"command": args.get("command"), "result": result})
         return self.observation(call, result, failed=False)
@@ -280,7 +339,12 @@ class AgentCore:
             return [], 0
 
         with ThreadPoolExecutor(max_workers=len(calls)) as executor:
-            observations = list(executor.map(self.invoke_tool, calls))
+            try:
+                observations = list(executor.map(self.invoke_tool, calls))
+            except KeyboardInterrupt:
+                if self.runtime is not None:
+                    self.runtime.interrupt()
+                raise
 
         return observations, len(calls)
 
@@ -396,11 +460,18 @@ class AgentCore:
         builder.add_edge(START, "agent_node")
         return builder.compile()
 
-    def run(self, problem_statement: str):
+    def run(self, problem_statement: str | None, *, history=None, request_id=None):
         # Measure agent graph execution; sandbox setup and patch collection are
         # outside this interval. Each graph records its actual model interactions.
         initial_state: AgentState = {
-            "messages": [HumanMessage(content=problem_statement)],
+            "messages": [
+                *(history or []),
+                *(
+                    [HumanMessage(content=problem_statement, id=request_id)]
+                    if problem_statement is not None
+                    else []
+                ),
+            ],
             "tool_call_iterations": 0,
             "model_iterations": 0,
         }

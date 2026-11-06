@@ -61,3 +61,24 @@ File permission tests create temporary FUSE mounts and require host access to `/
 ```bash
 CODEPILOT_DOCKER_TEST_IMAGE=<local-image> python -m pytest tests/test_docker_subagents.py -q
 ```
+
+
+## Offline interactive CLI
+
+Install with Python 3.11+ and `pip install -e '.[cli]'`, build the local image with
+`docker build -f containers/cli.Dockerfile -t codepilot-cli:local .`, then run
+`codepilot --repo /absolute/path/to/repository`. Experimental entrypoints retain
+Python 3.10 support and their existing soft decision budget.
+
+The CLI currently uses an explicitly labelled **offline model double**: it does
+not call DeepSeek or claim to solve tasks. It supports multi-turn trajectories,
+SQLite recovery, interrupt handling, exact pinned instructions, conflict policies,
+LangMem compaction with evidence references, bounded archive recall, and explicit
+`/diff` and `/apply` delivery. Agent tools operate in a separate Docker copy;
+related local edits stop application. `finish` returns to input without declaring
+external evaluation success. No memory-quality or coding-effect comparisons were run.
+
+See [the CLI operation guide](readme_cn.md#交互-cli离线模型替身) for installation,
+all commands, a scripted modification demo, recovery and failure behavior,
+configuration, extension hooks, and checks. Real provider setup and real token
+streaming remain future integration work.

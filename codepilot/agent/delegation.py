@@ -10,8 +10,8 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from codepilot.sandbox.base import ChildExecutionError
-from codepilot.trajectory import TrajectoryLogger
 from codepilot.tools.delegate import SubtaskSpec
+from codepilot.trajectory import TrajectoryLogger
 
 
 def describe_patch(changes):
@@ -110,23 +110,42 @@ def run_delegation_batch(parent, tasks, tool_call_id):
         directory = parent.trajectory_dir / "subagents" / report["subtask_id"]
         directory.mkdir(parents=True, exist_ok=True)
         child_agent = None
+        child_runtime = None
         changes = []
         try:
             with parent.sandbox.fork(baseline, scopes[index]) as child:
-                child_agent = AgentCore(
-                    parent.model,
-                    child,
-                    max_model_calls=parent.max_model_calls,
-                    trajectory_dir=directory,
-                    budget=parent.budget,
-                    is_subagent=True,
-                    agent_id=report["subtask_id"],
-                    run_id=parent.run_id,
-                    parent_tool_call_id=tool_call_id,
-                    logger=TrajectoryLogger(directory / "events.jsonl"),
-                )
+                if parent.runtime is not None:
+                    child_runtime = parent.runtime.child_runtime(
+                        parent, child, directory, report["subtask_id"]
+                    )
+                    child_agent = child_runtime.agent
+                    child_agent.parent_tool_call_id = tool_call_id
+                else:
+                    child_agent = AgentCore(
+                        parent.model,
+                        child,
+                        max_model_calls=parent.max_model_calls,
+                        trajectory_dir=directory,
+                        budget=parent.budget,
+                        is_subagent=True,
+                        agent_id=report["subtask_id"],
+                        run_id=parent.run_id,
+                        parent_tool_call_id=tool_call_id,
+                        logger=TrajectoryLogger(directory / "events.jsonl"),
+                    )
                 try:
-                    state = child_agent.run(json.dumps(spec.model_dump(), ensure_ascii=False))
+                    request = json.dumps(spec.model_dump(), ensure_ascii=False)
+                    state = (
+                        child_runtime.request(request)
+                        if child_runtime is not None
+                        else child_agent.run(request)
+                    )
+                    if child_runtime is not None:
+                        report["evidence"] = {
+                            "trajectory_id": child_runtime.id,
+                            "event_ids": list(child_runtime.state["message_sources"].values())[-8:],
+                        }
+                        report["compaction_count"] = child_runtime.state["compaction_count"]
                     report.update(
                         status="completed"
                         if state["termination_reason"] == "voluntary_completion"
@@ -135,10 +154,16 @@ def run_delegation_batch(parent, tasks, tool_call_id):
                         summary=state.get("summary", ""),
                         verification=child_agent.verification,
                         unresolved_issues=state.get("unresolved_issues", []),
-                        model_iterations=state["own_model_iterations"],
+                        model_iterations=state.get(
+                            "own_model_iterations", child_agent.normal_responses
+                        ),
                     )
-                    if state["termination_reason"] == "context_limit":
-                        report.update(status="failed", error="Subagent context limit")
+                    if state["termination_reason"] in {
+                        "context_limit",
+                        "compaction_paused",
+                        "interrupted",
+                    }:
+                        report.update(status="failed", error="Subagent paused or interrupted")
                 except Exception as exc:
                     report.update(
                         status="failed",
@@ -167,6 +192,10 @@ def run_delegation_batch(parent, tasks, tool_call_id):
             )
             # Preserve inspectable partial work even if a model request failed.
             # A stopped/failed environment may not permit a snapshot; never merge it.
+        if child_runtime is not None:
+            child_runtime.store.close()
+            with child_runtime.root.lock:
+                child_runtime.root.children.remove(child_runtime)
         report.setdefault("summary", "")
         report.setdefault("verification", child_agent.verification if child_agent else [])
         report.setdefault("unresolved_issues", [report["error"]] if "error" in report else [])
@@ -181,10 +210,17 @@ def run_delegation_batch(parent, tasks, tool_call_id):
 
     results = []
     with ThreadPoolExecutor(max_workers=parent.max_parallel_subagents) as executor:
-        for result in executor.map(run_child, accepted):
-            results.append(result)
+        try:
+            for result in executor.map(run_child, accepted):
+                results.append(result)
+        except KeyboardInterrupt:
+            if parent.runtime is not None:
+                parent.runtime.interrupt()
+            raise
     # All children have stopped; integrate sequentially, independently per child.
     for index, report, changes in results:
+        if parent.runtime is not None:
+            parent.runtime.check_cancelled()
         if report["status"] == "failed":
             report["modification_status"] = "withheld"
         elif changes:

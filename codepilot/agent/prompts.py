@@ -103,9 +103,21 @@ budget termination; do not invent subtask budgets or reserve finish calls.
 """
 
 
-def build_system_prompt(tools, *, is_subagent=False):
+def build_system_prompt(tools, *, is_subagent=False, interactive=False):
     descriptions = "\n".join(f"- {tool.name}: {tool.description}" for tool in tools)
     prompt = SYSTEM_PROMPT.format(tool_descriptions=descriptions)
+    if interactive:
+        start, end = prompt.index("<Limits>"), prompt.index("</Limits>") + len("</Limits>")
+        prompt = (
+            prompt[:start]
+            + """<Limits>
+This is an interactive request with no model decision count threshold.
+finish ends this request and returns to user input; it does not end the trajectory.
+Effective pinned instructions follow this system message and take precedence over
+inferred working memory. Historical instructions can have been superseded.
+</Limits>"""
+            + prompt[end:]
+        )
     if is_subagent:
         prompt += """\n<Subtask>
 Your user message contains the parent's goal, context, allowed_files and acceptance
