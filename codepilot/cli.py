@@ -1,9 +1,11 @@
-"""Plain terminal entrypoint. All shipped model behavior is explicitly offline."""
+"""Interactive terminal with configurable OpenAI-compatible models."""
 
 import argparse
 import json
 import subprocess
 import sys
+from dataclasses import replace
+from getpass import getpass
 from pathlib import Path
 
 from docker.errors import DockerException
@@ -11,10 +13,13 @@ from docker.errors import DockerException
 from codepilot.sandbox.base import SandboxError
 from codepilot.session import Session
 from codepilot.session.context import ContextConfig
-from codepilot.session.memory import StubConflictDetector
-from codepilot.session.model import ModelConfig, StubModel
+from codepilot.session.login import load_login, save_login, validate_login
+from codepilot.session.model import LiveModel, ModelConfig, create_provider
 
-HELP = """[STUB] Commands:
+HELP = """Commands:
+\\login | /login   configure API Key, Base URL and model name
+/model [NAME]   switch model (empty input prompts)
+/effort [on|off|default]   switch thinking mode
 /begin ... /end   multiline request (commands can also be entered this way)
 /save<original text>   save exact text after /save and execute it
 /sessions | /new | /resume ID | /exit
@@ -35,17 +40,17 @@ def show_event(event):
     if kind == "model_response":
         content = event["message"]["data"]["content"]
         if content:
-            print(f"[STUB] {content}", flush=True)
+            print(content, flush=True)
     elif kind in {"tool_call", "tool_result"}:
-        print(f"[STUB] {kind}: {event['name']} {event.get('status', 'running')}", flush=True)
+        print(f"{kind}: {event['name']} {event.get('status', 'running')}", flush=True)
     elif kind == "context_usage":
         print(
-            f"[STUB] context estimate: {event['estimated_input_tokens']} input tokens; "
+            f"context estimate: {event['estimated_input_tokens']} input tokens; "
             f"service usage: {event['actual_input_tokens']}",
             flush=True,
         )
     elif kind.startswith("compaction_") or kind in {"request_paused", "interrupted"}:
-        print(f"[STUB] {kind}: {event.get('reason', '')}", flush=True)
+        print(f"{kind}: {event.get('reason', '')}", flush=True)
 
 
 def read_request(input_fn):
@@ -106,18 +111,20 @@ def command(session, text):
     return True
 
 
-def main(argv=None, *, sandbox_factory=None, resume_factory=None, input_fn=None):
-    parser = argparse.ArgumentParser(description="CodePilot [STUB] offline CLI (Python 3.11+)")
-    parser.add_argument("--repo", type=Path)
+def main(argv=None, *, sandbox_factory=None, resume_factory=None, input_fn=None, secret_fn=None):
+    parser = argparse.ArgumentParser(description="CodePilot interactive CLI (Python 3.11+)")
+    parser.add_argument(
+        "--repo", type=Path, help="Workspace repository (default: current repository)"
+    )
     parser.add_argument("--request", help="Run one request, then retain the session and exit")
     parser.add_argument("--resume")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/codepilot")
     parser.add_argument("--image", default="codepilot-cli:local")
-    parser.add_argument("--stub-script", type=Path)
-    parser.add_argument("--stub-conflicts", type=Path)
     parser.add_argument("--context-config", type=Path)
-    parser.add_argument("--model-config", type=Path, help="Future provider settings; no API calls")
+    parser.add_argument(
+        "--model-config", type=Path, help="Model name, Base URL and token limits (JSON)"
+    )
     args = parser.parse_args(argv)
     if sys.version_info < (3, 11):
         print("CLI requires Python 3.11+ (LangMem); experimental entrypoints support Python 3.10.")
@@ -125,10 +132,17 @@ def main(argv=None, *, sandbox_factory=None, resume_factory=None, input_fn=None)
     if args.list:
         display(Session.list(args.state_dir))
         return 0
-    if args.repo is None and args.resume is None:
-        parser.error("provide --repo or --resume")
     if args.repo is not None and args.resume is not None:
         parser.error("use either --repo (new trajectory) or --resume")
+    if args.repo is None and args.resume is None:
+        current = Path.cwd()
+        root = subprocess.run(
+            ["git", "-C", str(current), "rev-parse", "--show-toplevel"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        args.repo = Path(root.stdout.strip()).resolve() if root.returncode == 0 else current
     if sandbox_factory is None:
         from codepilot.sandbox.local import LocalDockerSandbox
 
@@ -141,37 +155,84 @@ def main(argv=None, *, sandbox_factory=None, resume_factory=None, input_fn=None)
         model_config = ModelConfig(
             **(json.loads(args.model_config.read_text()) if args.model_config else {})
         )
-        detector = StubConflictDetector(
-            json.loads(args.stub_conflicts.read_text()) if args.stub_conflicts else []
-        )
+        credentials_path = args.state_dir / "credentials.json"
+        saved = load_login(credentials_path)
+        live = LiveModel()
+        if saved:
+            saved_config, key = saved
+            model_config = model_config if args.model_config else saved_config
+            live.provider = create_provider(model_config, key)
+
+        def login():
+            key = (secret_fn or getpass)("API Key (hidden): ").strip()
+            url = (input_fn or input)(f"Base URL [{model_config.base_url}]: ").strip()
+            name = (input_fn or input)(f"Model [{model_config.name}]: ").strip()
+            candidate = replace(
+                model_config, base_url=url or model_config.base_url, name=name or model_config.name
+            )
+            configure_model(candidate, key)
+            print("Configuration saved. The next request will connect to the model.")
+
+        def configure_model(candidate, key):
+            nonlocal model_config, saved
+            validate_login(candidate, key)
+            provider = create_provider(candidate, key)
+            save_login(credentials_path, candidate, key)
+            live.provider = provider
+            model_config = candidate
+            saved = (candidate, key)
+            session.state["model_config"] = candidate.__dict__
+            session.save()
+            print(f"Model: {candidate.name}; effort: {candidate.effort}")
+
+        def model_command(text):
+            parts = text.split(maxsplit=1)
+            if parts[0] not in {"/model", "/effort"}:
+                return False
+            if saved is None:
+                raise ValueError("Use /login to configure API Key and Base URL first")
+            field = "name" if parts[0] == "/model" else "effort"
+            value = (
+                parts[1].strip()
+                if len(parts) == 2
+                else (input_fn or input)(f"{parts[0]} [{getattr(model_config, field)}]: ").strip()
+            )
+            if not value:
+                print(f"Model: {model_config.name}; effort: {model_config.effort}")
+                return True
+            configure_model(replace(model_config, **{field: value}), saved[1])
+            return True
 
         def new_session(repo):
             created = Session.create(
                 repo,
-                StubModel(args.stub_script),
+                live,
                 sandbox_factory(repo, args.image),
                 directory=args.state_dir,
                 observer=show_event,
+                summary_model=live,
                 context_config=config,
-                conflict_detector=detector,
             )
             created.state["model_config"] = model_config.__dict__
             created.save()
             return created
 
         def resume(session_id):
-            return Session.resume(
+            restored = Session.resume(
                 session_id,
-                StubModel(args.stub_script),
+                live,
                 directory=args.state_dir,
                 sandbox_factory=resume_factory,
                 observer=show_event,
-                conflict_detector=detector,
+                summary_model=live,
             )
+            restored.state["model_config"] = model_config.__dict__
+            restored.save()
+            return restored
 
         def describe(current):
             print(
-                f"[STUB] session: {current.id}\nlocal repository: {current.repo}\n"
+                f"session: {current.id}\nlocal repository: {current.repo}\n"
                 f"Docker working copy: {getattr(current.sandbox, 'container_name', current.id)}",
                 flush=True,
             )
@@ -187,6 +248,9 @@ def main(argv=None, *, sandbox_factory=None, resume_factory=None, input_fn=None)
                 text = read_request(input_fn or input)
                 if not text.strip():
                     continue
+                if text in {"\\login", "/login"}:
+                    login()
+                    continue
                 if text == "/exit":
                     return 0
                 if text == "/sessions":
@@ -198,7 +262,7 @@ def main(argv=None, *, sandbox_factory=None, resume_factory=None, input_fn=None)
                     session.close()
                     session = replacement
                     describe(session)
-                elif command(session, text):
+                elif model_command(text) or command(session, text):
                     pass
                 elif text.startswith("/") and not (
                     text.startswith("/save") and (len(text) == 5 or text[5].isspace())

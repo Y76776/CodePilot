@@ -35,6 +35,15 @@ from codepilot.session.memory import MemoryConflict, MemoryEntry, no_conflicts, 
 from codepilot.session.store import SessionStore
 
 
+def load_project_instructions(repo):
+    """Snapshot root-level project instructions without changing their text."""
+    for name in ("agent.md", "AGENT.md"):
+        path = Path(repo) / name
+        if path.is_file():
+            return {"source": name, "text": path.read_text(encoding="utf-8")}
+    return None
+
+
 class Session:
     def __init__(
         self,
@@ -116,6 +125,7 @@ class Session:
             state: dict[str, Any] = {
                 "id": session_id,
                 "repo": str(Path(repo).resolve()),
+                "project_instructions": load_project_instructions(repo),
                 "messages": [],
                 "plan": "",
                 "workspace": descriptor,
@@ -161,6 +171,8 @@ class Session:
         sandbox = None
         try:
             state = store.load()
+            if "project_instructions" not in state:
+                state["project_instructions"] = load_project_instructions(state["repo"])
             if sandbox_factory is None:
                 from codepilot.sandbox.local import LocalDockerSandbox
 
@@ -205,6 +217,7 @@ class Session:
         state = {
             "id": child_id,
             "repo": str(self.repo),
+            "project_instructions": deepcopy(self.state.get("project_instructions")),
             "messages": [],
             "plan": "",
             "workspace": {},
@@ -265,6 +278,7 @@ class Session:
             if event_type == "context_usage":
                 self.state["last_estimated_tokens"] = payload["estimated_input_tokens"]
             if event_type == "model_response":
+                self.state["project_instructions_seen"] = True
                 usage = payload["message"]["data"].get("usage_metadata") or {}
                 if "input_tokens" in usage:
                     metrics = self.state["metrics"]
@@ -405,7 +419,20 @@ class Session:
             else []
         )
         start = self.state["cutoff"] if cutoff is None else cutoff
-        return [system, *pins, *memory, *history[start:]]
+        instructions = self.state.get("project_instructions")
+        project = (
+            [
+                SystemMessage(
+                    content=f"Project instructions ({instructions['source']}):\n"
+                    + instructions["text"]
+                )
+            ]
+            if instructions
+            and instructions["text"]
+            and not self.state.get("project_instructions_seen")
+            else []
+        )
+        return [system, *project, *pins, *memory, *history[start:]]
 
     def prepare_messages(self, agent, messages):
         system, history = messages[0], messages[1:]
